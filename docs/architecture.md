@@ -1,228 +1,246 @@
+# Architecture Documentation
+## ShopMart Sales Data Pipeline on AWS
+
+---
+
 # Part 1: Architecture Design
 
 ## Task 1.1: Architecture Diagram
 
 ### Architecture Overview
 
-The pipeline is designed as a fully event-driven, serverless architecture on AWS. It automatically processes CSV sales files uploaded by 50 stores each morning, validates data quality, transforms and aggregates the data, and makes results available for BI consumption — replacing the manual Excel process entirely.
+The ShopMart Sales Data Pipeline is a fully automated, event-driven data processing system built on AWS. It replaces the manual Excel-based workflow previously performed by the Business Intelligence team — reducing daily processing time from 3–4 hours to near real-time.
 
-**Diagram:** See `docs/architecture-diagram.png`
+The pipeline ingests raw CSV sales files uploaded by 50 stores each morning, validates and transforms the data, stores results in an analytics-optimized format, and exposes them to BI tools for querying and visualization. The entire orchestration is managed by AWS Step Functions, ensuring reliable sequencing, error handling, and observability across all stages.
 
----
+![architecture-diagram](architecture-diagram.png)
 
-### Data Flow: End-to-End
-
-```
-CSV on local
-    │
-    │ (1) Manual/automated upload
-    ▼
-S3 Raw-data bucket
-    │
-    │ (2) S3 Event Notification
-    ▼
-Amazon EventBridge
-    │
-    │ (3) Rule triggers workflow
-    ▼
-AWS Step Functions (Orchestrator)
-    │
-    │ (4) Invoke validation step
-    ▼
-AWS Lambda — Validate CSV file
-    │
-    ├─── (5a) Invalid file ──► S3 Error-data bucket
-    │                               │
-    │                               └──► Amazon SNS (error notification)
-    │
-    └─── (5b) Valid file ───► S3 Stage-data bucket
-                                    │
-                                    │ (6) Trigger ETL job
-                                    ▼
-                               AWS Glue (ETL Job)
-                                    │
-                                    │ (7) Write processed output
-                                    ▼
-                          S3 Processed-data bucket
-                                    │
-                                    │ (8) Trigger crawler
-                                    ▼
-                     Glue Crawler — Create/update schema
-                                    │
-                                    │ (9) Register table metadata
-                                    ▼
-                          AWS Glue Data Catalog
-                                    │
-                          ┌─────────┴──────────┐
-                          │ (Analytics layer)   │
-                          ▼                     ▼
-                    Amazon Athena        Amazon QuickSight
-                                    │
-                          (10) SNS success notification
-```
+**Key design principles:**
+- Event-driven ingestion triggered automatically on file upload
+- Separation of raw, staged, processed, and error data at the storage layer
+- Centralized orchestration via Step Functions for auditability and retry logic
+- Schema cataloging via AWS Glue for Athena compatibility
+- Observability through CloudWatch metrics, alarms, and SNS alerting
 
 ---
 
-### AWS Services Selection
+### AWS Services Used
 
-| Step | Service | Reason |
-|------|---------|--------|
-| **Ingestion** | **Amazon S3 (Raw)** | Durable, scalable object storage. Native event notification support. Cost-effective for storing raw CSV files with lifecycle policies. |
-| **Event trigger** | **Amazon EventBridge** | Decouples the S3 upload event from the processing workflow. Supports fine-grained filtering (e.g., only `.csv` files matching `store_*` pattern), retry policies, and dead-letter queues — more robust than direct S3→Lambda triggers for orchestration. |
-| **Orchestration** | **AWS Step Functions** | Manages the multi-step workflow (validate → transform → notify) with built-in error handling, retries, and state visibility. Avoids chaining Lambda functions directly, which is fragile and hard to monitor. |
-| **Validation** | **AWS Lambda** | Lightweight, fast execution for schema validation and data quality checks. Stateless and cost-efficient for short-lived tasks (< 15 min). Ideal for the validation step which does not require heavy compute. |
-| **Staging** | **Amazon S3 (Stage)** | Temporary holding area for validated files before ETL. Separates concerns between validation and transformation. |
-| **ETL / Transform** | **AWS Glue** | Managed Spark environment suited for processing 50 files × up to 5,000 rows. Handles deduplication, aggregation, and Parquet conversion natively. Scales automatically without managing servers. See ADR-002. |
-| **Processed storage** | **Amazon S3 (Processed)** | Stores output in Parquet format partitioned by date. Optimized for analytical queries via Athena. |
-| **Error storage** | **Amazon S3 (Error)** | Isolates bad records for auditing and reprocessing. Keeps the processed bucket clean. |
-| **Schema registry** | **AWS Glue Crawler + Data Catalog** | Automatically infers and registers the schema of processed Parquet files. Enables Athena and QuickSight to query data without manual DDL. |
-| **Query layer** | **Amazon Athena** | Serverless SQL on S3. No infrastructure to manage. Pay-per-query model is cost-efficient for BI team ad-hoc queries. |
-| **Visualization** | **Amazon QuickSight** | Native AWS BI tool with direct Athena integration. Supports scheduled dashboard refresh aligned with the daily pipeline run. |
-| **Notifications** | **Amazon SNS** | Sends success/failure alerts to the BI team via email or SMS. Triggered by Step Functions on both error paths and successful completion. |
-| **Observability** | **CloudWatch + CloudWatch Alarms** | Centralized logging for Lambda and Glue jobs. Alarms on error rates, job duration, and DLQ depth. |
+| Service | Purpose |
+|---|---|
+| **Amazon S3** | Multi-stage object storage: raw ingestion, staging, processed output, error isolation, and archiving |
+| **Amazon EventBridge Scheduler** | Triggers the Step Functions workflow on a scheduled basis aligned with the store upload window (6:00–8:00 AM daily) |
+| **AWS Step Functions** | Orchestrates the end-to-end pipeline workflow — sequencing Lambda, Glue, and Crawler steps with built-in error handling and retry |
+| **AWS Lambda** | Validates CSV file schema and data quality before processing; routes files to stage or error folder |
+| **AWS Glue (ETL Job)** | Performs data transformation: deduplication, null handling, `line_revenue` computation, and aggregation |
+| **AWS Glue Crawler** | Automatically infers and registers schema for both raw and transformed datasets into the Glue Data Catalog |
+| **AWS Glue Data Catalog** | Central metadata repository enabling Athena to query processed Parquet data without manual schema definition |
+| **Amazon SNS** | Sends success/error notifications to the BI team when pipeline completes or encounters critical failures |
+| **Amazon Athena** | Serverless SQL query engine over processed Parquet data in S3; used by analysts and BI tools |
+| **Amazon QuickSight** | BI visualization layer connecting to Athena for dashboards on daily revenue, top products, and payment metrics |
+| **Amazon CloudWatch** | Collects logs and metrics from Lambda, Glue, and Step Functions for operational monitoring |
+| **CloudWatch Alarms** | Triggers alerts on anomalies such as job failures, high error rates, or missing file uploads |
+
+---
+
+### Data Flow
+
+**1. Ingestion**
+
+1. Store staff upload CSV files from local systems to **S3 Raw-folder** following the naming convention `store_{store_id}_{YYYYMMDD}.csv`.
+2. **EventBridge Scheduler** fires at the configured time window (post 8:00 AM) to trigger the **AWS Step Functions** workflow, ensuring all store files have been uploaded before processing begins.
+3. Step Functions initiates the pipeline orchestration.
+
+**2. Validation & Staging**
+
+4. **AWS Lambda** is invoked to validate each CSV file — checking schema correctness (required columns, data types), detecting missing values, duplicate `order_id` entries, and negative quantities.
+5. Based on validation outcome:
+   - **(5a)** Files with critical schema errors are moved to **S3 Error-folder** and an **Amazon SNS** notification is sent to alert the BI team.
+   - **(5b)** Files passing validation are moved to **S3 Stage-folder** for downstream processing.
+
+**3. Processing**
+
+6. **AWS Glue Crawler** scans the Stage-folder and creates/updates the schema for raw files in the **Glue Data Catalog**.
+7. **AWS Glue ETL Job** reads staged data and performs:
+   - Removal of duplicate records
+   - Handling of missing values (null imputation or rejection)
+   - Computation of `line_revenue = quantity × unit_price`
+   - Aggregation of daily revenue, orders per customer, and payment success rate
+   - Separation of clean records from bad records
+8. Clean transformed data is written to **S3 Processed-folder** in **Parquet format** (columnar, compressed — optimized for Athena queries), partitioned by date using the path structure `processed/year=YYYY/month=MM/day=DD/`. This enables Athena partition pruning — queries scoped to a specific date range scan only the relevant partitions, reducing both query latency and cost.
+
+**4. Storage & Cataloging**
+
+9. A second **AWS Glue Crawler** scans the Processed-folder and registers the transformed schema in the **Glue Data Catalog**.
+10. The **Glue Data Catalog** makes the processed dataset queryable via Athena without manual DDL.
+11. After pipeline completion, **all files are moved out of the Raw-folder** — leaving it empty and ready for the next day's uploads:
+   - Files that passed validation and were successfully processed → moved to **S3 Archive-folder**
+   - Files that failed validation → moved to **S3 Error-folder**
+
+   SNS sends a final pipeline status notification. The Raw-folder will be empty after each run, ensuring no file is accidentally reprocessed on the next scheduled execution.
+
+**5. Consumption**
+
+- **Amazon Athena** queries the Parquet data in S3 Processed-folder using the Glue Data Catalog schema — enabling ad-hoc SQL analysis by the BI team.
+- **Amazon QuickSight** connects to Athena as a data source to render dashboards: daily revenue trends, top-selling products, payment success rates per store.
+
+**6. Observability**
+
+- **CloudWatch** aggregates logs from Lambda (validation errors), Glue (job metrics), and Step Functions (execution history).
+- **CloudWatch Alarms** monitor for job failures, elevated bad-record rates, and missing file uploads — triggering SNS alerts to the operations team.
 
 ---
 
 ## Task 1.2: Architecture Decision Records (ADRs)
 
-### ADR-001: Use Amazon EventBridge as the Pipeline Trigger
+---
+
+### ADR-1: Use Amazon EventBridge Scheduler for Daily Pipeline Trigger
 
 **Context:**
-The pipeline must start automatically whenever a new CSV file is uploaded to S3. With 50 stores uploading files in a 2-hour window (6:00–8:00 AM), the trigger mechanism needs to be reliable, filterable, and decoupled from the processing logic. A direct S3 event notification to Lambda or Step Functions is possible but tightly couples storage to compute.
+The pipeline must be triggered automatically once all 50 stores have completed their file uploads. The upload window is 6:00–8:00 AM daily. Triggering too early risks processing incomplete data; triggering on each individual file upload would cause 50 separate pipeline executions per day, increasing cost and complexity. A single, time-based trigger post-upload window is the most reliable approach.
 
 **Decision:**
-Use Amazon EventBridge with an S3 event source rule to trigger the Step Functions workflow. The rule filters on `s3:ObjectCreated:*` events where the object key matches the pattern `store_*_*.csv`, ensuring only valid store files initiate the pipeline.
+Use **Amazon EventBridge Scheduler** to trigger the AWS Step Functions execution once daily at a fixed time after the upload window closes (e.g., 8:15 AM). This ensures all store files are present in S3 Raw-folder before the pipeline begins, and consolidates processing into a single daily execution.
 
 **Alternatives Considered:**
-
-| Alternative | Reason Rejected |
-|-------------|-----------------|
-| S3 → Lambda (direct trigger) | Tightly couples S3 to Lambda. No built-in filtering by key pattern at the event level. Harder to add routing logic later. |
-| S3 → SQS → Lambda | Adds operational overhead. SQS is better suited when consumers need to pull at their own pace; here we want immediate push-based triggering. |
-| Scheduled EventBridge rule (cron) | Polling-based approach. Would process all files at a fixed time rather than reacting to each upload. Increases latency and complicates partial-failure handling. |
+- **S3 Event Notification → Lambda trigger on each upload:** Would fire 50 times per day (once per file), creating 50 independent pipeline runs. Difficult to coordinate aggregation across all stores and increases Step Functions execution costs.
+- **Amazon EventBridge Rules (event-based):** Can react to S3 PutObject events but requires additional logic to determine when all 50 files have arrived — adding complexity without clear benefit over a scheduled approach.
+- **AWS Lambda scheduled via CloudWatch Events (legacy):** Functionally equivalent but EventBridge Scheduler is the modern replacement with better timezone support, flexible scheduling expressions, and built-in retry on failed invocations.
 
 **Consequences:**
-- ✅ Loose coupling — S3 and Step Functions are independent; either can be replaced without affecting the other.
-- ✅ Fine-grained filtering — only files matching the naming convention trigger the pipeline, preventing accidental triggers from unrelated uploads.
-- ✅ Built-in retry and dead-letter queue support on the EventBridge rule.
-- ⚠️ Slight added latency (~1–2 seconds) compared to a direct S3 trigger, which is acceptable given the batch nature of the workload.
-- ⚠️ EventBridge has a limit of 300 rules per event bus by default — not a concern at 50 stores but worth noting for future scale.
+- Simple, predictable trigger with no dependency on individual file arrival events.
+- If a store uploads late (after 8:00 AM), their file will be missed in the scheduled run — requires a manual re-trigger or a separate late-file handling process.
+- EventBridge Scheduler supports timezone-aware cron expressions, making it straightforward to align with local business hours.
+- Failed invocations (e.g., IAM permission issues) are retried automatically by EventBridge Scheduler and logged to CloudWatch.
 
 ---
 
-### ADR-002: Use AWS Glue Instead of Lambda for ETL Processing
+### ADR-2: Store Processed Data in Parquet Format on S3
 
 **Context:**
-After validation, each CSV file must be cleaned (deduplication, null handling), enriched (`line_revenue = quantity * unit_price`), aggregated (daily revenue, top products, payment success rate), and written to S3 in an analytics-friendly format. Lambda has a 15-minute execution limit and 10 GB memory cap, which may be insufficient for large files (up to 5,000 rows × 50 files = 250,000 rows/day) and complex aggregations.
+The BI team needs to run analytical queries (daily revenue, top products, payment success rate) over data accumulated from 50 stores. The output format must be compatible with Athena and QuickSight, and must support efficient querying without full table scans.
 
 **Decision:**
-Use AWS Glue (PySpark ETL job) for the transformation step. Glue provides a managed Apache Spark environment that scales horizontally, supports native Parquet output, and integrates directly with the Glue Data Catalog for automatic schema registration.
+Write all processed output to **Amazon S3 in Apache Parquet format**, partitioned by `order_date` and `store_id`. Register the schema in **AWS Glue Data Catalog** for Athena access.
 
 **Alternatives Considered:**
-
-| Alternative | Reason Rejected |
-|-------------|-----------------|
-| AWS Lambda (Python + pandas) | 15-minute timeout and memory limits are risky for large files. Pandas is not distributed — cannot scale horizontally. Dependency packaging (pandas, pyarrow) adds complexity. |
-| AWS EMR | Significantly higher cost and operational overhead for this data volume. Cluster startup time (3–5 min) adds latency. Overkill for 250K rows/day. |
-| AWS Glue DataBrew | Visual, no-code tool — less flexible for custom aggregation logic. Cannot be version-controlled as cleanly as a PySpark script. |
-| ECS / Fargate (containerized Python) | More control but requires container management, ECR, and task definition maintenance. No native Data Catalog integration. |
+- **CSV in S3:** Human-readable but inefficient for analytical queries — no columnar compression, no predicate pushdown. Athena costs scale with data scanned.
+- **Amazon RDS / Aurora:** Relational databases support SQL queries but are not cost-effective for append-only analytical workloads. Requires schema management and ongoing instance costs.
+- **Amazon Redshift:** Excellent for large-scale analytics but introduces significant infrastructure overhead and cost for a dataset of this size (~50 files × 5,000 rows/day).
 
 **Consequences:**
-- ✅ Handles current and future data volume without code changes — just adjust DPU allocation.
-- ✅ Native integration with Glue Data Catalog — schema is registered automatically after each run.
-- ✅ Built-in job bookmarking to avoid reprocessing already-handled files (supports BR-7).
-- ⚠️ Glue job startup time is ~1–2 minutes (cold start for Spark context). Acceptable for a daily batch pipeline but not suitable for real-time use cases.
-- ⚠️ Higher cost per run compared to Lambda for very small files. Mitigated by using Glue's 1/16 DPU (Flex execution) for non-urgent jobs.
+- Parquet's columnar compression reduces S3 storage costs and Athena query costs significantly.
+- Partitioning by date and store enables partition pruning — queries scoped to a date range avoid scanning the full dataset.
+- Requires Glue Crawler to maintain schema registration; adds a step to the pipeline but is fully automated.
+- Parquet is not human-readable — raw/error files are retained in CSV for manual inspection if needed.
 
 ---
 
-### ADR-003: Store Processed Data in Parquet Format
+### ADR-3: Use AWS Lambda for CSV Validation Before ETL
 
 **Context:**
-Processed data must be stored in a format suitable for analytics queries (BR-4) and accessible by BI tools like QuickSight (BR-6). The BI team will run queries such as daily revenue aggregations, top product rankings, and payment success rates — typically column-oriented access patterns on large datasets.
+<cite index="1-5">Input files may contain data quality issues including missing values, duplicates, and negative quantities.</cite> Running a full Glue ETL job on a malformed or structurally invalid file wastes compute resources and produces misleading partial outputs. Validation must be fast, cheap, and capable of routing bad files before they enter the transformation stage.
 
 **Decision:**
-Store all processed output in Apache Parquet format, partitioned by `order_date` (e.g., `s3://processed/year=2024/month=01/day=15/`). Use Snappy compression. Register the schema in the Glue Data Catalog so Athena can query it directly.
+Use a dedicated **AWS Lambda function** as the first processing step to validate each CSV file's schema (column names, data types, row count sanity) and flag critical quality issues. Lambda routes files to either the Stage-folder (pass) or Error-folder (fail) and triggers SNS notification on critical failures.
 
 **Alternatives Considered:**
-
-| Alternative | Reason Rejected |
-|-------------|-----------------|
-| CSV (plain text) | No compression, no columnar optimization. Full table scans on every query — expensive with Athena (pay per byte scanned). No schema enforcement. |
-| JSON / NDJSON | Verbose format, larger file size than Parquet. Row-oriented — inefficient for column-selective analytical queries. |
-| ORC | Also columnar and compressed, but Parquet has broader ecosystem support (Athena, Glue, Spark, pandas all prefer Parquet). Less tooling friction. |
-| Delta Lake / Iceberg | Adds ACID transaction support and time-travel, but introduces significant complexity. Not justified for an append-only daily batch pipeline at this scale. |
+- **Validate inside the Glue Job:** Possible, but Glue has a minimum billing duration (~1 minute DPU) and a cold start overhead. Using Glue for lightweight validation is cost-inefficient.
+- **AWS Glue DataBrew:** Provides visual data quality rules but adds cost per node-hour and is less flexible for custom validation logic (e.g., checking filename convention, store ID format).
+- **No pre-validation (validate in Glue only):** Risks propagating bad data into the processed layer if Glue error handling is misconfigured. Harder to isolate the root cause of failures.
 
 **Consequences:**
-- ✅ 60–90% storage reduction compared to CSV due to columnar compression.
-- ✅ Athena query costs reduced significantly — only columns referenced in the query are scanned.
-- ✅ Partition pruning on `order_date` means daily queries scan only the relevant partition, not the entire dataset.
-- ✅ QuickSight can connect directly via Athena with no additional transformation.
-- ⚠️ Parquet files are not human-readable — debugging requires Athena, Glue, or a local Parquet reader.
-- ⚠️ Small file problem: if each store produces a separate Parquet file, Athena performance degrades. Mitigated by having the Glue job merge all store files for a given day into a single partitioned output.
+- Lambda provides sub-second validation at minimal cost (~$0.0000002 per invocation).
+- Clear separation of concerns: Lambda owns validation, Glue owns transformation.
+- Lambda has a 15-minute execution limit — sufficient for validating a single CSV file (500–5,000 rows), but not suitable for large-scale transformation.
+- Validation logic must be maintained separately from ETL logic; changes to the schema require updates in both Lambda and Glue.
 
 ---
 
 ## Task 1.3: Failure Scenarios
 
-### Scenario 1: Malformed or Corrupt CSV File
+---
+
+### Scenario 1: CSV File Fails Schema Validation
 
 **What happens?**
-A store uploads a CSV file with incorrect column names, wrong data types, or encoding issues (e.g., UTF-16 instead of UTF-8). The Lambda validation step fails to parse the file.
+A store uploads a CSV file with missing required columns (e.g., `unit_price` is absent), incorrect data types (e.g., `order_date` formatted as `DD/MM/YYYY` instead of `YYYY-MM-DD`), or a malformed header row. The Lambda validation function detects the structural issue.
 
 **How does the system detect it?**
-The Lambda function performs schema validation on every file: checks for required columns (`order_id`, `customer_id`, `product_id`, `order_date`, `quantity`, `unit_price`, `payment_status`), validates data types, and checks file encoding. Any failure raises a structured exception caught by Step Functions.
+The Lambda function checks for required column presence, data type conformance, and basic row integrity on every file before it proceeds to staging. If validation fails, the function returns a failure status to Step Functions.
 
 **Recovery strategy:**
-Step Functions routes the file to the `S3 Error-data` bucket with a metadata tag indicating the failure reason. The original file is preserved in `S3 Raw-data` for manual inspection. The pipeline continues processing other files — one bad file does not block the rest.
+Step Functions transitions to the error branch: the file is moved from Raw-folder to S3 Error-folder with a timestamped error log. The pipeline continues processing remaining valid files. The store is expected to re-upload a corrected file; the pipeline can be re-triggered manually or on the next scheduled run.
 
 **Who needs to be notified?**
-SNS sends an alert to the BI team and the store operations team, including the store ID, filename, and error description. The store is expected to re-upload a corrected file.
+- **BI / Data Engineering team** via SNS email/SMS alert with the filename, store ID, and error description.
+- Optionally, the store operations team if a store-level notification channel is configured.
 
 ---
 
 ### Scenario 2: AWS Glue ETL Job Failure
 
 **What happens?**
-The Glue job fails mid-execution due to an out-of-memory error, a Spark exception on unexpected data values (e.g., non-numeric `unit_price`), or a transient AWS service issue.
+The Glue ETL job encounters an unhandled exception during transformation — for example, a data type casting error on an edge-case record, an out-of-memory condition on an unusually large file batch, or a transient AWS service error.
 
 **How does the system detect it?**
-Step Functions monitors the Glue job status via the `GlueStartJobRun` + `GlueGetJobRun` integration. If the job transitions to `FAILED` or `ERROR` state, Step Functions catches the error and transitions to the failure branch.
+Step Functions monitors the Glue job execution status. If the job transitions to `FAILED` or `TIMEOUT` state, Step Functions catches the error via its `Catch` block and transitions to the failure handling state. CloudWatch Logs captures the full Glue job error output.
 
 **Recovery strategy:**
-Step Functions retries the Glue job up to 2 times with exponential backoff (supports BR-8). If all retries are exhausted, the staged file remains in `S3 Stage-data` (not deleted) so the job can be manually re-triggered or automatically retried in the next pipeline run. Glue job bookmarking ensures already-processed records are not duplicated on retry.
+Step Functions retries the Glue job up to a configured number of attempts (e.g., 2 retries with exponential backoff) before marking the execution as failed. On final failure, the staged files are moved to S3 Error-folder and an SNS alert is sent. The Data Engineering team investigates CloudWatch Logs, fixes the root cause, and re-runs the Step Functions execution manually for the affected date partition.
 
 **Who needs to be notified?**
-SNS sends an alert to the data engineering team with the job run ID, error message, and affected file. CloudWatch Alarm triggers if the Glue job failure rate exceeds a threshold within a time window.
+- **Data Engineering team** via SNS alert with execution ARN, job name, error message, and affected date.
+- **BI team** if the failure means daily metrics will not be available by the expected time.
 
 ---
 
-### Scenario 3: Missing Store Files (Incomplete Daily Upload)
+### Scenario 3: Missing or Delayed File Upload from a Store
 
 **What happens?**
-One or more stores fail to upload their CSV file during the 6:00–8:00 AM window due to network issues, store system downtime, or human error. The pipeline processes only the files that arrived, resulting in incomplete daily aggregations.
+One or more stores fail to upload their CSV file within the expected window (6:00–8:00 AM). This could be due to network issues at the store, a local system failure, or human error. When the pipeline runs, it processes only the files present — silently omitting the missing store's data from daily aggregations.
 
 **How does the system detect it?**
-A scheduled EventBridge rule triggers a Lambda function at 8:30 AM (after the upload window closes) to audit the `S3 Raw-data` bucket. It compares the list of received files against the expected list of 50 store IDs for the current date. Any missing store IDs are flagged.
+A CloudWatch Alarm or a post-pipeline Lambda check compares the number of files processed against the expected count (50 stores). If the count is below threshold (e.g., fewer than 45 files), the alarm triggers. Alternatively, a file presence check can be embedded as a Step Functions state that validates expected store IDs before proceeding.
 
 **Recovery strategy:**
-The audit Lambda publishes a report of missing stores to SNS. The daily aggregation job proceeds with available data and marks the output with a `partial=true` metadata flag so downstream consumers (Athena, QuickSight) can identify incomplete days. When the missing store uploads its file late, the pipeline reprocesses it and updates the aggregation for that day.
+The pipeline proceeds with available files and completes normally. The missing store's data is flagged in the processing summary log. Once the store uploads the delayed file (outside the normal window), a manual or on-demand Step Functions execution can be triggered to process the late file and update the aggregations for that date partition.
 
 **Who needs to be notified?**
-SNS notifies the BI team and store operations team with the list of missing store IDs. The BI team is aware that the day's dashboard may show incomplete data until all files are received.
+- **BI team** via SNS alert listing the missing store IDs so they are aware that daily totals are incomplete.
+- **Store operations / IT team** for the affected store(s) to investigate the upload failure.
 
 ---
 
-### Scenario 4: S3 Bucket Unavailable or Permission Denied
+### Scenario 4: S3 Event / EventBridge Trigger Failure
 
 **What happens?**
-A misconfigured IAM policy change or an S3 service disruption causes the Lambda or Glue job to fail when attempting to read from `S3 Stage-data` or write to `S3 Processed-data`.
+The EventBridge Scheduler fails to trigger the Step Functions execution — due to a misconfigured schedule rule, an IAM permission issue on the EventBridge-to-StepFunctions role, or a transient AWS service disruption. The pipeline does not run despite files being present in the Raw-folder.
 
 **How does the system detect it?**
-Lambda and Glue jobs throw `AccessDeniedException` or `NoSuchBucket` errors, which are caught by Step Functions error handlers. CloudWatch Logs capture the full error stack trace.
+CloudWatch Metrics for Step Functions will show zero executions started for the expected time window. A CloudWatch Alarm on `ExecutionsStarted` count below 1 within the scheduled window will fire. EventBridge also emits failed invocation events to CloudWatch Logs.
 
 **Recovery strategy:**
-Step Functions transitions to the error state and sends an SNS alert immediately — no retries are attempted for permission errors (retrying would not resolve the root cause). For transient S3 service issues, Step Functions retries with backoff. The IAM team is alerted to review recent policy changes via CloudTrail audit logs.
+The Data Engineering team is alerted and manually triggers the Step Functions execution via the AWS Console or CLI, pointing it at the files already present in the Raw-folder. The root cause (IAM policy, schedule expression) is corrected and the schedule is re-enabled. No data is lost as files remain in S3.
 
 **Who needs to be notified?**
-SNS alerts the data engineering team and cloud infrastructure team. For `AccessDeniedException`, the alert includes the IAM principal and the denied action to accelerate diagnosis.
+- **Data Engineering team** via CloudWatch Alarm → SNS for immediate investigation.
+- **BI team** if the delay impacts the availability of daily reports.
+
+---
+
+### Scenario 5: Athena Query Failure Due to Schema Mismatch
+
+**What happens?**
+A change in the upstream CSV format (e.g., a new column added, a column renamed) causes the Glue Crawler to update the schema in the Data Catalog in a way that is incompatible with existing Athena saved queries or QuickSight datasets. Athena queries begin returning errors or incorrect results.
+
+**How does the system detect it?**
+Athena query failures are logged in CloudWatch. QuickSight dataset refresh failures surface in the QuickSight console. A post-pipeline validation step (optional Lambda) can run a smoke-test Athena query after each pipeline execution and alert on failure.
+
+**Recovery strategy:**
+The Data Engineering team reviews the Glue Data Catalog for schema drift, rolls back to the previous table version if needed (Glue supports schema versioning), and coordinates with store operations to enforce the canonical CSV schema. Athena table definitions are updated to accommodate the new schema if the change is intentional.
+
+**Who needs to be notified?**
+- **Data Engineering team** via CloudWatch Alarm or post-pipeline validation alert.
+- **BI team** to pause report distribution until schema consistency is restored.
