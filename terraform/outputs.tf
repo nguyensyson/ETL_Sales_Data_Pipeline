@@ -51,3 +51,18 @@ output "glue_catalog_database" {
   description = "Name of the Glue Data Catalog database."
   value       = aws_glue_catalog_database.main.name
 }
+
+output "athena_workgroup" {
+  description = "Name of the Athena workgroup for pipeline analytics queries."
+  value       = aws_athena_workgroup.main.name
+}
+
+output "athena_results_bucket" {
+  description = "S3 bucket where Athena query results are stored."
+  value       = aws_s3_bucket.athena_results.bucket
+}
+
+output "quicksight_role_arn" {
+  description = "IAM role ARN to assign to QuickSight for Athena access."
+  value       = aws_iam_role.quicksight.arn
+}

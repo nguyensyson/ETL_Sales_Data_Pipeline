@@ -69,3 +69,19 @@ variable "critical_error_rate_threshold" {
   type        = number
   default     = 0.2
 }
+
+# ---------------------------------------------------------------------------
+# Analytics — Athena + QuickSight
+# ---------------------------------------------------------------------------
+
+variable "enable_quicksight" {
+  description = "Set to true to provision the QuickSight Athena data source. Requires QuickSight to be subscribed in the AWS account first."
+  type        = bool
+  default     = false
+}
+
+variable "quicksight_admin_user" {
+  description = "QuickSight username (IAM identity) that will own the Athena data source. Required when enable_quicksight = true."
+  type        = string
+  default     = ""
+}

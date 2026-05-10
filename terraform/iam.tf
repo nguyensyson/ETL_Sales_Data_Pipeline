@@ -166,6 +166,7 @@ resource "aws_iam_role_policy" "sfn_invoke" {
         Resource = aws_lambda_function.csv_validator.arn
       },
       {
+        # Glue Job (.sync integration) + Crawler (aws-sdk poll pattern)
         Effect = "Allow"
         Action = [
           "glue:StartJobRun",
@@ -173,7 +174,8 @@ resource "aws_iam_role_policy" "sfn_invoke" {
           "glue:GetJobRuns",
           "glue:BatchStopJobRun",
           "glue:StartCrawler",
-          "glue:GetCrawler"
+          "glue:GetCrawler",
+          "glue:StopCrawler"
         ]
         Resource = "*"
       },
