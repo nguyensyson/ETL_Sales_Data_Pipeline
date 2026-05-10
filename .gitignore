@@ -1,0 +1,36 @@
+# Terraform local cache
+.terraform/
+**/.terraform/*
+
+# Terraform state files
+*.tfstate
+*.tfstate.*
+
+# Terraform lock file (có thể giữ nếu muốn fix version provider)
+# Nếu team muốn đồng bộ version provider thì KHÔNG ignore file này
+# .terraform.lock.hcl
+
+# Terraform variable files (thường chứa secrets)
+*.tfvars
+*.tfvars.json
+
+# Crash log
+crash.log
+crash.*.log
+
+# Override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# CLI configuration files
+.terraformrc
+terraform.rc
+
+# Backup files
+*.backup
+
+# Lambda layer build artifacts
+# Các package Python được cài vào đây khi build layer, không cần commit
+.build/layer/python/
