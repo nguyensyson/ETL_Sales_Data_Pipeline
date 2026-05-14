@@ -127,6 +127,12 @@ resource "aws_iam_role_policy" "glue_s3" {
         ]
       },
       {
+        # Crawler needs GetObject to read Parquet files for schema inference
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = "${aws_s3_bucket.processed.arn}/*"
+      },
+      {
         Effect   = "Allow"
         Action   = ["s3:ListBucket"]
         Resource = [

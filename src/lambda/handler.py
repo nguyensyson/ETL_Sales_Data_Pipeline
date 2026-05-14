@@ -23,7 +23,9 @@ import io
 import json
 import logging
 import os
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import boto3
 import pandas as pd
@@ -45,6 +47,9 @@ REQUIRED_COLUMNS = [
     "order_date", "quantity", "unit_price", "payment_status",
 ]
 
+# Timezone used to determine "today" — matches the business timezone
+PIPELINE_TIMEZONE = ZoneInfo(os.environ.get("PIPELINE_TIMEZONE", "Asia/Ho_Chi_Minh"))
+
 # ---------------------------------------------------------------------------
 # AWS clients
 # ---------------------------------------------------------------------------
@@ -65,23 +70,44 @@ def lambda_handler(event: dict, context: Any) -> dict:
     """
     Entry point invoked by Step Functions.
 
-    Expects *event* to contain an optional ``prefix`` key to scope which
-    objects in the raw bucket to process (defaults to all ``.csv`` files).
+    Expects *event* to contain:
+      - ``prefix``       (optional) — scope which objects in the raw bucket to
+                         process (defaults to all ``.csv`` files).
+      - ``target_date``  (optional) — date string in ``YYYYMMDD`` format to
+                         process files for a specific date.  Defaults to today
+                         in the configured ``PIPELINE_TIMEZONE``.  Pass this
+                         when reprocessing historical files.
 
     Returns a summary dict consumed by the next Step Functions state.
     """
     prefix = event.get("prefix", "")
-    logger.info("Starting validation. RAW_BUCKET=%s prefix='%s'", RAW_BUCKET, prefix)
+
+    # Resolve the target date: explicit override or today in business timezone
+    target_date: str = event.get("target_date") or datetime.now(PIPELINE_TIMEZONE).strftime("%Y%m%d")
+    logger.info(
+        "Starting validation. RAW_BUCKET=%s prefix='%s' target_date=%s",
+        RAW_BUCKET, prefix, target_date,
+    )
 
     paginator = s3.get_paginator("list_objects_v2")
     pages = paginator.paginate(Bucket=RAW_BUCKET, Prefix=prefix)
 
     results = []
+    skipped = 0
     for page in pages:
         for obj in page.get("Contents", []):
             key = obj["Key"]
             if not key.endswith(".csv"):
                 continue
+
+            filename = key.split("/")[-1]
+
+            # Only process files whose name contains today's date (YYYYMMDD)
+            if target_date not in filename:
+                logger.info("Skipping %s — filename does not match target date %s", filename, target_date)
+                skipped += 1
+                continue
+
             result = _process_file(key)
             results.append(result)
 
@@ -89,7 +115,10 @@ def lambda_handler(event: dict, context: Any) -> dict:
     passed = sum(1 for r in results if r["status"] == "staged")
     failed = sum(1 for r in results if r["status"] == "error")
 
-    logger.info("Validation complete — total: %d, staged: %d, errors: %d", total, passed, failed)
+    logger.info(
+        "Validation complete — target_date: %s, total: %d, staged: %d, errors: %d, skipped: %d",
+        target_date, total, passed, failed, skipped,
+    )
 
     if total > 0 and (failed / total) >= CRITICAL_ERROR_RATE_THRESHOLD:
         _publish_alert(
@@ -101,9 +130,11 @@ def lambda_handler(event: dict, context: Any) -> dict:
         )
 
     return {
+        "target_date": target_date,
         "total_files": total,
         "staged_files": passed,
         "error_files": failed,
+        "skipped_files": skipped,
         "details": results,
     }
 
